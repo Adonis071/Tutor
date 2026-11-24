@@ -1,0 +1,6 @@
+{
+  "name": "Minha sala de aula",
+  "description": "Ambiente interativo de estudos com quadro visual dinâmico, caderno de conceitos, tutor por voz em tempo real via Gemini Live e geração de infográficos com Nano Banana Pro.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
