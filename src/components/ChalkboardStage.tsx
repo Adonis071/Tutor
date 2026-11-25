@@ -773,9 +773,11 @@ export const ChalkboardStage: React.FC<ChalkboardStageProps> = ({
     if (
       representation.type === 'relationship_map' &&
       representation.relationships &&
+      Array.isArray(representation.relationships.nodes) &&
       representation.relationships.nodes.length > 0
     ) {
-      const { nodes, edges } = representation.relationships;
+      const nodes = representation.relationships.nodes;
+      const edges = representation.relationships.edges || [];
       return (
         <div className="p-4 sm:p-6 space-y-5">
           {representation.svgCode && representation.svgCode.includes('<svg') && (
@@ -789,8 +791,8 @@ export const ChalkboardStage: React.FC<ChalkboardStageProps> = ({
               const colorObj =
                 CHALK_COLORS[node.color as keyof typeof CHALK_COLORS] || CHALK_COLORS.blue;
               const isHighlighted = matchesHighlight(highlightedElementId, [node.id, node.label]);
-              const relatedEdges = edges.filter(
-                (e) => e.from === node.id || e.to === node.id || e.from === node.label
+              const relatedEdges = (edges || []).filter(
+                (e) => e && (e.from === node.id || e.to === node.id || e.from === node.label)
               );
 
               return (

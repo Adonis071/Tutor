@@ -107,6 +107,12 @@ export async function parseApiResponse<T = any>(resp: Response): Promise<T> {
     );
   }
 
+  if (resp.status === 404 || rawText.includes('NOT_FOUND')) {
+    throw new Error(
+      'Rota da API não encontrada no servidor (HTTP 404). Se você fez deploy na Vercel, faça um novo deploy com a pasta /api e o arquivo vercel.json atualizados e configure a variável GEMINI_API_KEY no painel da Vercel.'
+    );
+  }
+
   if (resp.status === 502 || resp.status === 504) {
     throw new Error(
       `O servidor demorou muito para responder (${resp.status}). Tente novamente com um documento menor ou em alguns instantes.`

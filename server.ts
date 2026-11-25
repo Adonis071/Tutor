@@ -4,7 +4,6 @@ import http from 'http';
 import path from 'path';
 import fs from 'fs';
 import { WebSocketServer, WebSocket } from 'ws';
-import { createServer as createViteServer } from 'vite';
 import {
   GoogleGenAI,
   Type,
@@ -19,7 +18,7 @@ function getGenAIClient(apiVersion?: string): GoogleGenAI {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
     throw new Error(
-      'GEMINI_API_KEY_MISSING: A chave da API Gemini não está configurada no ambiente. Configure sua chave no painel Settings > Secrets do AI Studio.'
+      'GEMINI_API_KEY_MISSING: A chave GEMINI_API_KEY não está configurada no ambiente. Configure em Settings > Secrets (AI Studio) ou em Project Settings > Environment Variables (Vercel).'
     );
   }
   return new GoogleGenAI({
@@ -47,7 +46,7 @@ function classifyGeminiError(err: unknown, attemptedModel: string) {
       errorCategory: 'PERMISSIONS_OR_KEY',
       attemptedModel,
       userMessage:
-        'Chave de API ausente ou inválida. Verifique a configuração em Settings > Secrets no AI Studio.',
+        'Chave GEMINI_API_KEY ausente ou inválida no servidor. Verifique Settings > Secrets no AI Studio ou Environment Variables no painel da Vercel.',
       technicalDetails: rawMessage,
     };
   }
@@ -477,28 +476,26 @@ const CONCEPT_SCHEMA = {
   ],
 };
 
-async function startServer() {
-  const app = express();
-  const server = http.createServer(app);
+export const app = express();
 
-  app.use(express.json({ limit: '35mb' }));
+app.use(express.json({ limit: '35mb' }));
 
-  app.use((err: any, _req: express.Request, res: express.Response, next: express.NextFunction) => {
-    if (err) {
-      res.status(err.status || 400).json({
-        userMessage:
-          err.type === 'entity.too.large'
-            ? 'O documento enviado é muito grande. Tente enviar um PDF menor ou colar o texto das páginas.'
-            : 'Erro ao processar os dados enviados ao servidor.',
-        technicalDetails: err.message || String(err),
-      });
-      return;
-    }
-    next();
-  });
+app.use((err: any, _req: express.Request, res: express.Response, next: express.NextFunction) => {
+  if (err) {
+    res.status(err.status || 400).json({
+      userMessage:
+        err.type === 'entity.too.large'
+          ? 'O documento enviado é muito grande. Tente enviar um PDF menor ou colar o texto das páginas.'
+          : 'Erro ao processar os dados enviados ao servidor.',
+      technicalDetails: err.message || String(err),
+    });
+    return;
+  }
+  next();
+});
 
-  // 1. Analyze Document (PDF base64, extracted PDF pages + figure snapshots, or Pasted Notes)
-  app.post('/api/analyze-document', async (req, res) => {
+// 1. Analyze Document (PDF base64, extracted PDF pages + figure snapshots, or Pasted Notes)
+app.post('/api/analyze-document', async (req, res) => {
     const modelName = 'gemini-4-hydrogen';
     try {
       const { pdfBase64, pageSnapshots, fileName, rawText, sourceType } = req.body as {
@@ -1069,6 +1066,38 @@ Forneça 2 ou 3 observações curtas de orientação para o estudante (verifican
     }
   });
 
+  // 5b. Mint Ephemeral Token for Gemini Live in Serverless Deployments (e.g. Vercel)
+  // Keeps GEMINI_API_KEY strictly on the server while allowing direct WebSocket BidiGenerateContentConstrained
+  app.post('/api/live-token', async (_req, res) => {
+    const liveModel = 'gemini-3.8-live';
+    try {
+      const ai = getGenAIClient('v1alpha');
+      const expireTime = new Date(Date.now() + 30 * 60 * 1000).toISOString();
+      const tokenResp = await ai.authTokens.create({
+        config: {
+          uses: 3,
+          expireTime,
+        },
+      });
+
+      if (!tokenResp?.name) {
+        throw new Error('Falha ao gerar token efêmero para sessão Live.');
+      }
+
+      res.json({
+        ephemeralToken: tokenResp.name,
+        model: liveModel,
+        expiresAt: expireTime,
+      });
+    } catch (err) {
+      const classified = classifyGeminiError(err, liveModel);
+      res.status(classified.status).json(classified);
+    }
+  });
+
+async function startServer() {
+  const server = http.createServer(app);
+
   // 6. Real-Time Gemini Live WebSocket Bridge (/live)
   const wss = new WebSocketServer({ noServer: true });
 
@@ -1388,6 +1417,7 @@ Lista de Conceitos Disponíveis: ${(initialContext.allConcepts || []).join(', ')
       res.sendFile(path.join(distPath, 'index.html'));
     });
   } else {
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
@@ -1400,6 +1430,10 @@ Lista de Conceitos Disponíveis: ${(initialContext.allConcepts || []).join(', ')
   });
 }
 
-startServer().catch((err) => {
-  console.error('Failed to start server:', err);
-});
+if (!process.env.VERCEL) {
+  startServer().catch((err) => {
+    console.error('Failed to start server:', err);
+  });
+}
+
+export default app;

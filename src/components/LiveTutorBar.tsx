@@ -10,6 +10,7 @@ import {
   AlertCircle,
 } from 'lucide-react';
 import { StudyConcept, StudyMaterialAnalysis, GeneratedInfographic } from '../types';
+import { parseApiResponse } from '../utils/pdfExtractor';
 
 export type LiveConnectionState =
   | 'disconnected'
@@ -72,6 +73,86 @@ function base64ToFloat32Array(base64: string): Float32Array {
   return float32;
 }
 
+const DIRECT_LIVE_TOOLS = [
+  {
+    name: 'selectConceptOnBoard',
+    description:
+      'Troca o conceito atualmente exibido no quadro didático para outro conceito do documento quando o aluno pede para avançar, voltar ou mudar de tópico.',
+    parameters: {
+      type: 'OBJECT',
+      properties: {
+        conceptIdOrTitle: {
+          type: 'STRING',
+          description: 'ID ou título do conceito para exibir no quadro.',
+        },
+      },
+      required: ['conceptIdOrTitle'],
+    },
+  },
+  {
+    name: 'highlightBoardElement',
+    description:
+      'Destaca visualmente uma legenda, região ou componente específico no quadro verde enquanto você explica por voz.',
+    parameters: {
+      type: 'OBJECT',
+      properties: {
+        elementIdOrLabel: {
+          type: 'STRING',
+          description:
+            'ID ou texto da legenda/elemento no quadro atual (ex: "umbra", "penumbra", "lua", "xilema", "floema").',
+        },
+      },
+      required: ['elementIdOrLabel'],
+    },
+  },
+  {
+    name: 'updateBoardRepresentation',
+    description:
+      'Atualiza a pergunta norteadora, a síntese ou adiciona uma nova anotação explicativa ao quadro verde atual para responder visualmente a uma dúvida ou hipótese do aluno.',
+    parameters: {
+      type: 'OBJECT',
+      properties: {
+        newGuidingQuestion: {
+          type: 'STRING',
+          description: 'Nova pergunta norteadora no topo do quadro.',
+        },
+        newTakeaway: {
+          type: 'STRING',
+          description: 'Nova síntese ou conclusão na base do quadro.',
+        },
+        addedAnnotationLabel: {
+          type: 'STRING',
+          description: 'Título curto de uma nova legenda/nota adicionada ao quadro.',
+        },
+        addedAnnotationDetail: {
+          type: 'STRING',
+          description: 'Explicação curta da nova nota adicionada ao quadro.',
+        },
+        addedAnnotationColor: {
+          type: 'STRING',
+          description: 'Cor do giz no quadro: "yellow", "blue", "coral" ou "white".',
+        },
+      },
+      required: ['newGuidingQuestion', 'newTakeaway'],
+    },
+  },
+  {
+    name: 'generateInfographicWithNanoBananaPro',
+    description:
+      'Aciona a geração real de um infográfico ilustrado em 16:9 (2K) com o modelo Nano Banana Pro (gemini-3-pro-image) sobre o conceito atual quando o aluno pedir por voz para criar ou gerar um infográfico.',
+    parameters: {
+      type: 'OBJECT',
+      properties: {
+        focusQuestion: {
+          type: 'STRING',
+          description: 'Dúvida ou foco principal solicitado pelo aluno para o infográfico.',
+        },
+      },
+      required: ['focusQuestion'],
+    },
+  },
+];
+
 export const LiveTutorBar: React.FC<LiveTutorBarProps> = ({
   studyMaterial,
   activeConcept,
@@ -89,6 +170,7 @@ export const LiveTutorBar: React.FC<LiveTutorBarProps> = ({
   const [transcripts, setTranscripts] = useState<LiveTranscriptEntry[]>([]);
 
   const wsRef = useRef<WebSocket | null>(null);
+  const transportModeRef = useRef<'proxy' | 'direct_ephemeral'>('proxy');
   const isMutedRef = useRef(false);
   const inputAudioCtxRef = useRef<AudioContext | null>(null);
   const outputAudioCtxRef = useRef<AudioContext | null>(null);
@@ -154,6 +236,9 @@ export const LiveTutorBar: React.FC<LiveTutorBarProps> = ({
       outputAudioCtxRef.current = null;
     }
     if (wsRef.current) {
+      wsRef.current.onclose = null;
+      wsRef.current.onerror = null;
+      wsRef.current.onmessage = null;
       wsRef.current.close();
       wsRef.current = null;
     }
@@ -185,6 +270,28 @@ export const LiveTutorBar: React.FC<LiveTutorBarProps> = ({
     []
   );
 
+  const sendContextTextToLive = useCallback((text: string) => {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+    if (transportModeRef.current === 'direct_ephemeral') {
+      ws.send(
+        JSON.stringify({
+          realtimeInput: {
+            text: `[ATUALIZAÇÃO DE CONTEXTO DA SALA DE AULA]: ${text}`,
+          },
+        })
+      );
+    } else {
+      ws.send(
+        JSON.stringify({
+          type: 'contextUpdate',
+          text,
+        })
+      );
+    }
+  }, []);
+
   // Synchronize concept navigation or user selections to active Live session
   useEffect(() => {
     if (
@@ -198,15 +305,12 @@ export const LiveTutorBar: React.FC<LiveTutorBarProps> = ({
         const annotationsText = (activeConcept.representation.annotations || [])
           .map((a) => `${a.label}: ${a.detail}`)
           .join('; ');
-        wsRef.current.send(
-          JSON.stringify({
-            type: 'contextUpdate',
-            text: `O aluno selecionou o conceito "${activeConcept.title}" (${activeConcept.sourceReference}). Explicação: ${activeConcept.detailedExplanation}. No quadro está exibido o esquema "${activeConcept.representation.title}" (${activeConcept.representation.type}) com a pergunta "${activeConcept.representation.guidingQuestion}" e legendas: ${annotationsText}.`,
-          })
+        sendContextTextToLive(
+          `O aluno selecionou o conceito "${activeConcept.title}" (${activeConcept.sourceReference}). Explicação: ${activeConcept.detailedExplanation}. No quadro está exibido o esquema "${activeConcept.representation.title}" (${activeConcept.representation.type}) com a pergunta "${activeConcept.representation.guidingQuestion}" e legendas: ${annotationsText}.`
         );
       }
     }
-  }, [activeConcept, studyMaterial]);
+  }, [activeConcept, studyMaterial, sendContextTextToLive]);
 
   // Synchronize highlighted board element with active Live session
   useEffect(() => {
@@ -216,32 +320,53 @@ export const LiveTutorBar: React.FC<LiveTutorBarProps> = ({
       highlightedElement &&
       activeConcept
     ) {
-      wsRef.current.send(
-        JSON.stringify({
-          type: 'contextUpdate',
-          text: `O aluno clicou/destacou o elemento "${highlightedElement}" no quadro do conceito "${activeConcept.title}".`,
-        })
+      sendContextTextToLive(
+        `O aluno clicou/destacou o elemento "${highlightedElement}" no quadro do conceito "${activeConcept.title}".`
       );
     }
-  }, [highlightedElement, activeConcept]);
+  }, [highlightedElement, activeConcept, sendContextTextToLive]);
 
   // When a new Nano Banana Pro infographic completes, send it as visual context to the Live tutor
   useEffect(() => {
+    const ws = wsRef.current;
     if (
-      wsRef.current &&
-      wsRef.current.readyState === WebSocket.OPEN &&
+      ws &&
+      ws.readyState === WebSocket.OPEN &&
       activeInfographic &&
       lastSentInfographicIdRef.current !== activeInfographic.id
     ) {
       lastSentInfographicIdRef.current = activeInfographic.id;
-      wsRef.current.send(
-        JSON.stringify({
-          type: 'visualContext',
-          imageBase64: activeInfographic.imageUrl,
-          mimeType: activeInfographic.mimeType,
-          caption: `Infográfico gerado com ${activeInfographic.modelUsed} sobre "${activeInfographic.conceptTitle}". Título: "${activeInfographic.visualDirection.shortTitle}". Conclusão: "${activeInfographic.visualDirection.conclusion}". O aluno agora pode fazer perguntas sobre esta imagem.`,
-        })
-      );
+      const caption = `Infográfico gerado com ${activeInfographic.modelUsed} sobre "${activeInfographic.conceptTitle}". Título: "${activeInfographic.visualDirection.shortTitle}". Conclusão: "${activeInfographic.visualDirection.conclusion}". O aluno agora pode fazer perguntas sobre esta imagem.`;
+
+      if (transportModeRef.current === 'direct_ephemeral') {
+        const cleanBase64 = activeInfographic.imageUrl.replace(/^data:[^;]+;base64,/, '');
+        ws.send(
+          JSON.stringify({
+            realtimeInput: {
+              video: {
+                data: cleanBase64,
+                mimeType: activeInfographic.mimeType || 'image/png',
+              },
+            },
+          })
+        );
+        ws.send(
+          JSON.stringify({
+            realtimeInput: {
+              text: `[CONTEXTO VISUAL ENVIADO AO TUTOR]: ${caption}`,
+            },
+          })
+        );
+      } else {
+        ws.send(
+          JSON.stringify({
+            type: 'visualContext',
+            imageBase64: activeInfographic.imageUrl,
+            mimeType: activeInfographic.mimeType,
+            caption,
+          })
+        );
+      }
     }
   }, [activeInfographic]);
 
@@ -277,6 +402,292 @@ export const LiveTutorBar: React.FC<LiveTutorBarProps> = ({
     };
   }, []);
 
+  const executeFrontendToolCall = useCallback(
+    async (name: string, args: Record<string, any>): Promise<Record<string, unknown>> => {
+      let toolResult: Record<string, unknown> = { status: 'error' };
+
+      if (name === 'selectConceptOnBoard') {
+        const res = callbacksRef.current.onSelectConceptByIdOrTitle(
+          String(args?.conceptIdOrTitle || '')
+        );
+        toolResult = res.success
+          ? {
+              status: 'success',
+              message: `Quadro atualizado com sucesso para o conceito "${res.matchedTitle}".`,
+            }
+          : {
+              status: 'not_found',
+              message: 'Conceito não encontrado na lista atual do documento.',
+            };
+        if (res.success) {
+          appendTranscript(
+            'system',
+            `Quadro atualizado pelo tutor: conceito "${res.matchedTitle}"`
+          );
+        }
+      } else if (name === 'highlightBoardElement') {
+        const res = callbacksRef.current.onHighlightElement(
+          String(args?.elementIdOrLabel || '')
+        );
+        toolResult = {
+          status: res.success ? 'success' : 'failed',
+          highlightedElement: res.highlighted,
+        };
+        if (res.success) {
+          appendTranscript('system', `Elemento destacado no quadro: "${res.highlighted}"`);
+        }
+      } else if (name === 'updateBoardRepresentation') {
+        const res = callbacksRef.current.onUpdateBoardFromLive({
+          newGuidingQuestion: String(args?.newGuidingQuestion || ''),
+          newTakeaway: String(args?.newTakeaway || ''),
+          addedAnnotationLabel: args?.addedAnnotationLabel
+            ? String(args.addedAnnotationLabel)
+            : undefined,
+          addedAnnotationDetail: args?.addedAnnotationDetail
+            ? String(args.addedAnnotationDetail)
+            : undefined,
+          addedAnnotationColor: args?.addedAnnotationColor,
+        });
+        toolResult = {
+          status: res.success ? 'success' : 'failed',
+          message: 'Representação e anotações do quadro verde atualizadas.',
+        };
+        if (res.success) {
+          appendTranscript('system', 'O tutor adicionou uma nova anotação ao quadro verde.');
+        }
+      } else if (name === 'generateInfographicWithNanoBananaPro') {
+        appendTranscript(
+          'system',
+          'Gerando infográfico 16:9 com Nano Banana Pro (gemini-3-pro-image)...'
+        );
+        const res = await callbacksRef.current.onTriggerInfographicFromLive(
+          String(args?.focusQuestion || '')
+        );
+        toolResult = res.success
+          ? {
+              status: 'success',
+              message:
+                'Infográfico gerado com sucesso pelo gemini-3-pro-image e exibido ao aluno.',
+            }
+          : {
+              status: 'failed',
+              error:
+                res.error || 'Não foi possível gerar o infográfico com gemini-3-pro-image.',
+            };
+      }
+
+      return toolResult;
+    },
+    [appendTranscript]
+  );
+
+  const attachMicProcessor = useCallback(
+    (
+      inputCtx: AudioContext,
+      stream: MediaStream,
+      ws: WebSocket,
+      mode: 'proxy' | 'direct_ephemeral'
+    ) => {
+      if (processorRef.current) {
+        processorRef.current.disconnect();
+      }
+      const source = inputCtx.createMediaStreamSource(stream);
+      const processor = inputCtx.createScriptProcessor(4096, 1, 1);
+      processorRef.current = processor;
+
+      processor.onaudioprocess = (event) => {
+        if (isMutedRef.current) return;
+        if (ws.readyState === WebSocket.OPEN) {
+          const channelData = event.inputBuffer.getChannelData(0);
+          const base64Audio = float32ToPcm16Base64(channelData);
+          if (mode === 'direct_ephemeral') {
+            ws.send(
+              JSON.stringify({
+                realtimeInput: {
+                  audio: {
+                    data: base64Audio,
+                    mimeType: 'audio/pcm;rate=16000',
+                  },
+                },
+              })
+            );
+          } else {
+            ws.send(JSON.stringify({ type: 'audio', audio: base64Audio }));
+          }
+        }
+      };
+
+      source.connect(processor);
+      processor.connect(inputCtx.destination);
+    },
+    []
+  );
+
+  const connectDirectWithEphemeralToken = useCallback(
+    async (inputCtx: AudioContext, stream: MediaStream) => {
+      const tokenResp = await fetch('/api/live-token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+      });
+      const tokenData = await parseApiResponse(tokenResp);
+      if (!tokenResp.ok || !tokenData?.ephemeralToken) {
+        throw new Error(
+          tokenData?.userMessage ||
+            'Não foi possível autenticar a sessão de voz com o servidor (/api/live-token).'
+        );
+      }
+
+      const ephemeralToken = String(tokenData.ephemeralToken);
+      const modelName = String(tokenData.model || 'gemini-3.8-live');
+      const fullModelPath = modelName.startsWith('models/') ? modelName : `models/${modelName}`;
+
+      const directUrl = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContentConstrained?access_token=${encodeURIComponent(
+        ephemeralToken
+      )}`;
+
+      const directWs = new WebSocket(directUrl);
+      transportModeRef.current = 'direct_ephemeral';
+      wsRef.current = directWs;
+
+      const annotationsSummary = (activeConcept?.representation.annotations || [])
+        .map((a) => `${a.label} (${a.detail})`)
+        .join('; ');
+
+      const systemInstructionText = `Você é o tutor de voz em tempo real da "Minha sala de aula", falando sempre em português do Brasil com tom acolhedor, claro, breve e didático.
+REGRAS FUNDAMENTAIS:
+1. Você NÃO vê a tela automaticamente; baseie-se sempre no contexto do documento, no conceito atual e na representação do quadro que o sistema envia a você.
+2. Mantenha suas respostas faladas concisas (2 a 4 frases por turno) para permitir diálogo natural e perguntas de acompanhamento do estudante.
+3. Você possui ferramentas reais conectadas ao quadro verde da sala de aula:
+   - Use "highlightBoardElement" para destacar uma região ou legenda existente no desenho do quadro enquanto explica.
+   - Use "updateBoardRepresentation" quando quiser anotar uma conclusão, analogia ou hipótese ("E se mudarmos isso?") no quadro.
+   - Use "selectConceptOnBoard" se o aluno pedir para mudar para outro conceito do caderno.
+   - Use "generateInfographicWithNanoBananaPro" se o aluno pedir por voz para criar ou gerar um infográfico.
+4. NUNCA anuncie que alterou um desenho, trocou de conceito ou gerou um infográfico antes de receber a confirmação real da ferramenta correspondente.
+
+CONTEXTO INICIAL DA AULA:
+Documento: ${studyMaterial?.documentTitle || 'Material de estudo'}
+Resumo: ${studyMaterial?.executiveSummary || ''}
+Conceito Atual no Quadro: ${activeConcept?.title || ''} (${activeConcept?.sourceReference || ''})
+Explicação do Conceito: ${activeConcept?.detailedExplanation || ''}
+Representação no Quadro: ${
+        activeConcept
+          ? `${activeConcept.representation.title} [${activeConcept.representation.type}] - Pergunta: ${activeConcept.representation.guidingQuestion}. Legendas: ${annotationsSummary}`
+          : ''
+      }
+Lista de Conceitos Disponíveis: ${(studyMaterial?.concepts || [])
+        .map((c) => `${c.id} ("${c.title}")`)
+        .join(', ')}`;
+
+      directWs.onopen = () => {
+        directWs.send(
+          JSON.stringify({
+            setup: {
+              model: fullModelPath,
+              generationConfig: {
+                responseModalities: ['AUDIO'],
+                speechConfig: {
+                  voiceConfig: {
+                    prebuiltVoiceConfig: {
+                      voiceName: 'Zephyr',
+                    },
+                  },
+                },
+              },
+              systemInstruction: {
+                parts: [{ text: systemInstructionText }],
+              },
+              tools: [{ functionDeclarations: DIRECT_LIVE_TOOLS }],
+              inputAudioTranscription: {},
+              outputAudioTranscription: {},
+            },
+          })
+        );
+        lastSentConceptIdRef.current = activeConcept?.id || null;
+      };
+
+      directWs.onmessage = async (event) => {
+        try {
+          const rawData =
+            typeof event.data === 'string'
+              ? event.data
+              : event.data instanceof Blob
+              ? await event.data.text()
+              : '';
+          if (!rawData) return;
+          const message = JSON.parse(rawData);
+
+          if (message.setupComplete !== undefined) {
+            setLiveState('listening');
+            attachMicProcessor(inputCtx, stream, directWs, 'direct_ephemeral');
+            return;
+          }
+
+          const content = message.serverContent;
+          if (content?.inputTranscription?.text) {
+            appendTranscript('student', content.inputTranscription.text);
+          }
+          if (content?.outputTranscription?.text) {
+            appendTranscript('tutor', content.outputTranscription.text);
+          }
+          for (const part of content?.modelTurn?.parts ?? []) {
+            if (part.inlineData?.data) {
+              playAudioChunk(part.inlineData.data);
+            }
+          }
+          if (content?.interrupted) {
+            stopAllPlayback();
+            setLiveState('listening');
+          }
+
+          const calls = message.toolCall?.functionCalls ?? [];
+          for (const call of calls) {
+            const callId = call.id || `call_${Date.now()}`;
+            const callName = call.name || '';
+            const callArgs = call.args || {};
+            const toolResult = await executeFrontendToolCall(callName, callArgs);
+            if (directWs.readyState === WebSocket.OPEN) {
+              directWs.send(
+                JSON.stringify({
+                  toolResponse: {
+                    functionResponses: [
+                      {
+                        id: callId,
+                        name: callName,
+                        response: toolResult,
+                      },
+                    ],
+                  },
+                })
+              );
+            }
+          }
+        } catch (err) {
+          console.error('Error processing direct Live message:', err);
+        }
+      };
+
+      directWs.onerror = () => {
+        setErrorMessage('Falha na conexão WebSocket com o servidor Gemini Live.');
+        cleanupSession();
+        setLiveState('error');
+      };
+
+      directWs.onclose = () => {
+        setLiveState((prev) => (prev === 'error' ? 'error' : 'disconnected'));
+      };
+    },
+    [
+      activeConcept,
+      studyMaterial,
+      attachMicProcessor,
+      appendTranscript,
+      playAudioChunk,
+      stopAllPlayback,
+      executeFrontendToolCall,
+      cleanupSession,
+    ]
+  );
+
   const startLiveSession = async () => {
     setErrorMessage(null);
     setLiveState('connecting');
@@ -309,9 +720,12 @@ export const LiveTutorBar: React.FC<LiveTutorBarProps> = ({
 
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       const ws = new WebSocket(`${protocol}//${window.location.host}/live`);
+      transportModeRef.current = 'proxy';
       wsRef.current = ws;
+      let proxyOpened = false;
 
       ws.onopen = () => {
+        proxyOpened = true;
         const annotationsSummary = (activeConcept?.representation.annotations || [])
           .map((a) => `${a.label} (${a.detail})`)
           .join('; ');
@@ -336,23 +750,7 @@ export const LiveTutorBar: React.FC<LiveTutorBarProps> = ({
         );
 
         lastSentConceptIdRef.current = activeConcept?.id || null;
-
-        // Start microphone 16kHz PCM capture
-        const source = inputCtx.createMediaStreamSource(stream);
-        const processor = inputCtx.createScriptProcessor(4096, 1, 1);
-        processorRef.current = processor;
-
-        processor.onaudioprocess = (event) => {
-          if (isMutedRef.current) return;
-          if (ws.readyState === WebSocket.OPEN) {
-            const channelData = event.inputBuffer.getChannelData(0);
-            const base64Audio = float32ToPcm16Base64(channelData);
-            ws.send(JSON.stringify({ type: 'audio', audio: base64Audio }));
-          }
-        };
-
-        source.connect(processor);
-        processor.connect(inputCtx.destination);
+        attachMicProcessor(inputCtx, stream, ws, 'proxy');
       };
 
       ws.onmessage = async (event) => {
@@ -377,81 +775,7 @@ export const LiveTutorBar: React.FC<LiveTutorBarProps> = ({
             appendTranscript('tutor', msg.text);
           } else if (msg.type === 'toolCall') {
             const { id, name, args } = msg;
-            let toolResult: Record<string, unknown> = { status: 'error' };
-
-            if (name === 'selectConceptOnBoard') {
-              const res = callbacksRef.current.onSelectConceptByIdOrTitle(
-                String(args?.conceptIdOrTitle || '')
-              );
-              toolResult = res.success
-                ? {
-                    status: 'success',
-                    message: `Quadro atualizado com sucesso para o conceito "${res.matchedTitle}".`,
-                  }
-                : {
-                    status: 'not_found',
-                    message: 'Conceito não encontrado na lista atual do documento.',
-                  };
-              if (res.success) {
-                appendTranscript(
-                  'system',
-                  `Quadro atualizado pelo tutor: conceito "${res.matchedTitle}"`
-                );
-              }
-            } else if (name === 'highlightBoardElement') {
-              const res = callbacksRef.current.onHighlightElement(
-                String(args?.elementIdOrLabel || '')
-              );
-              toolResult = {
-                status: res.success ? 'success' : 'failed',
-                highlightedElement: res.highlighted,
-              };
-              if (res.success) {
-                appendTranscript(
-                  'system',
-                  `Elemento destacado no quadro: "${res.highlighted}"`
-                );
-              }
-            } else if (name === 'updateBoardRepresentation') {
-              const res = callbacksRef.current.onUpdateBoardFromLive({
-                newGuidingQuestion: String(args?.newGuidingQuestion || ''),
-                newTakeaway: String(args?.newTakeaway || ''),
-                addedAnnotationLabel: args?.addedAnnotationLabel
-                  ? String(args.addedAnnotationLabel)
-                  : undefined,
-                addedAnnotationDetail: args?.addedAnnotationDetail
-                  ? String(args.addedAnnotationDetail)
-                  : undefined,
-                addedAnnotationColor: args?.addedAnnotationColor,
-              });
-              toolResult = {
-                status: res.success ? 'success' : 'failed',
-                message: 'Representação e anotações do quadro verde atualizadas.',
-              };
-              if (res.success) {
-                appendTranscript('system', 'O tutor adicionou uma nova anotação ao quadro verde.');
-              }
-            } else if (name === 'generateInfographicWithNanoBananaPro') {
-              appendTranscript(
-                'system',
-                'Gerando infográfico 16:9 com Nano Banana Pro (gemini-3-pro-image)...'
-              );
-              const res = await callbacksRef.current.onTriggerInfographicFromLive(
-                String(args?.focusQuestion || '')
-              );
-              toolResult = res.success
-                ? {
-                    status: 'success',
-                    message:
-                      'Infográfico gerado com sucesso pelo gemini-3-pro-image e exibido ao aluno.',
-                  }
-                : {
-                    status: 'failed',
-                    error:
-                      res.error ||
-                      'Não foi possível gerar o infográfico com gemini-3-pro-image.',
-                  };
-            }
+            const toolResult = await executeFrontendToolCall(name, args || {});
 
             if (ws.readyState === WebSocket.OPEN) {
               ws.send(
@@ -474,7 +798,25 @@ export const LiveTutorBar: React.FC<LiveTutorBarProps> = ({
         }
       };
 
-      ws.onerror = () => {
+      ws.onerror = async () => {
+        if (!proxyOpened) {
+          // Serverless environment (e.g. Vercel) does not support WebSocket upgrades on /live;
+          // fall back seamlessly to server-minted ephemeral token + direct Bidi WebSocket.
+          try {
+            ws.onclose = null;
+            await connectDirectWithEphemeralToken(inputCtx, stream);
+            return;
+          } catch (fallbackErr) {
+            setErrorMessage(
+              fallbackErr instanceof Error
+                ? fallbackErr.message
+                : 'Falha na conexão WebSocket com o servidor Gemini Live.'
+            );
+            cleanupSession();
+            setLiveState('error');
+            return;
+          }
+        }
         setErrorMessage('Falha na conexão WebSocket com o servidor Gemini Live.');
         cleanupSession();
         setLiveState('error');
